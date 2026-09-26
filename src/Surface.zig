@@ -2755,13 +2755,9 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        // We only refresh links if link hover is enabled for the current
+        // mouse reporting state and mods (see mouseLinkHoverEnabled).
+        if (self.mouseLinkHoverEnabled()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -3797,6 +3793,18 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// Returns true if link hover detection should run for the current mouse
+/// reporting state and modifiers. See SurfaceMouse.linkHoverEnabled.
+///
+/// The renderer state mutex is not required, matching mouseShiftCapture(false).
+fn mouseLinkHoverEnabled(self: *const Surface) bool {
+    return SurfaceMouse.linkHoverEnabled(
+        self.io.terminal.flags.mouse_event,
+        self.mouse.mods,
+        self.mouseShiftCapture(false),
+    );
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -3955,6 +3963,12 @@ pub fn mouseButtonCallback(
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
+
+            // A hovered link while mouse reporting is on means the terminal
+            // owns this click (super held, see mouseLinkHoverEnabled): the
+            // release opens the link, so do not report the press either or
+            // the program would see half a click.
+            if (self.mouse.over_link) break :report;
 
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
@@ -4644,18 +4658,35 @@ pub fn cursorPosCallback(
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
     // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
-    if ((over_link or
-        self.mouse.link_point == null or
-        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
-    {
-        // If we were previously over a link, we always update. We do this so that if the text
-        // changed underneath us, even if the mouse didn't move, we update the URL hints and state
-        try self.mouseRefreshLinks(pos, pos_vp, over_link);
+    // link hover is enabled for the current mouse reporting state and mods
+    // (see mouseLinkHoverEnabled).
+    if (self.mouseLinkHoverEnabled()) {
+        if (over_link or
+            self.mouse.link_point == null or
+            (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp)))
+        {
+            // If we were previously over a link, we always update. We do this so that if the text
+            // changed underneath us, even if the mouse didn't move, we update the URL hints and state
+            try self.mouseRefreshLinks(pos, pos_vp, over_link);
+        }
+    } else if (over_link) {
+        // Hover was enabled and is now disabled with the pointer still on the
+        // link, e.g. super released and reported only through this event's
+        // mods while mouse reporting is on. Publish the clear so the apprt
+        // does not keep a stale URL, and forget the cached point so the next
+        // enabled callback re-evaluates the cell.
+        self.mouse.link_point = null;
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .mouse_shape,
+            self.io.terminal.mouse_shape,
+        );
+        _ = try self.rt_app.performAction(
+            .{ .surface = self },
+            .mouse_over_link,
+            .{ .url = "" },
+        );
+        try self.queueRender();
     }
 
     // Do a mouse report
