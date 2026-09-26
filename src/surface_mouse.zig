@@ -125,6 +125,54 @@ pub fn isRectangleSelectState(mods: input.Mods) bool {
         mods.ctrlOrSuper() and mods.alt;
 }
 
+/// Returns true if link hover detection should run for the given mouse
+/// reporting state and modifiers.
+///
+/// While the terminal has mouse reporting enabled the application owns the
+/// pointer, so link detection normally pauses. Two cases keep links usable:
+///
+/// * shift is held and the terminal is not allowed to capture shift, which
+///   releases the pointer from the application.
+/// * super is held. Mouse reports encode only shift, alt, and ctrl, so an
+///   application never observes super-modified pointer input. Keeping link
+///   detection alive for super lets the default macOS super+click link
+///   binding keep working inside TUIs that enable mouse reporting.
+pub fn linkHoverEnabled(
+    mouse_event: terminal.MouseEvent,
+    mods: input.Mods,
+    shift_capture: bool,
+) bool {
+    if (mouse_event == .none) return true;
+    if (mods.shift and !shift_capture) return true;
+    return mods.super;
+}
+
+test "linkHoverEnabled" {
+    const testing = std.testing;
+
+    // No mouse reporting: always enabled regardless of mods.
+    try testing.expect(linkHoverEnabled(.none, .{}, false));
+    try testing.expect(linkHoverEnabled(.none, .{}, true));
+    try testing.expect(linkHoverEnabled(.none, .{ .super = true }, true));
+
+    // Mouse reporting with no mods: the application owns the pointer.
+    try testing.expect(!linkHoverEnabled(.x10, .{}, false));
+    try testing.expect(!linkHoverEnabled(.normal, .{}, true));
+
+    // Shift releases the pointer only when the terminal may not capture it.
+    try testing.expect(linkHoverEnabled(.normal, .{ .shift = true }, false));
+    try testing.expect(!linkHoverEnabled(.normal, .{ .shift = true }, true));
+
+    // Super is never delivered through mouse reports, so links stay live.
+    try testing.expect(linkHoverEnabled(.normal, .{ .super = true }, false));
+    try testing.expect(linkHoverEnabled(.normal, .{ .super = true }, true));
+    try testing.expect(linkHoverEnabled(.any, .{ .super = true, .shift = true }, true));
+
+    // Modifiers the application does observe do not bypass reporting.
+    try testing.expect(!linkHoverEnabled(.normal, .{ .ctrl = true }, true));
+    try testing.expect(!linkHoverEnabled(.normal, .{ .alt = true }, true));
+}
+
 test "keyToMouseShape" {
     const testing = std.testing;
 
