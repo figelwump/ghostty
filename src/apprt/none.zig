@@ -6,6 +6,10 @@ const apprt = @import("../apprt.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// No event loop exists in this runtime. Mailboxes can still be used
+    /// by native tests without a GUI host.
+    pub fn wakeup(_: *const App) void {}
+
     /// Always return false as there is no apprt to communicate with.
     pub fn performIpc(
         _: Allocator,

@@ -39,3 +39,12 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Immutable host support for OSC 7501 reports and lifecycle actions.
+supports_program_status: bool = false,
+
+/// Surface lifetime signal for status writers blocked on the UI mailbox.
+program_status_closed: ?*const @import("std").atomic.Value(bool) = null,
+
+/// Stable identity; queued reports must not follow a reused surface pointer.
+program_status_surface_id: u64 = 0,

@@ -772,6 +772,9 @@ pub const Application = extern struct {
 
             .ring_bell => Action.ringBell(target),
 
+            // This runtime does not opt in to OSC 7501.
+            .program_status, .program_status_reset => return false,
+
             // GTK has no accessibility consumer for this yet.
             .selection_changed => {},
 

@@ -147,6 +147,9 @@ pub fn deinit(self: *App) void {
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
 
+    // Surface IO threads have stopped, so no more reports can be queued.
+    self.discardProgramStatusMessages();
+
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
     // destroy only gets called when the app is shutting down and this
@@ -534,10 +537,23 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     // a simple linear search here.
     if (self.hasSurface(surface)) {
         try surface.handleMessage(msg);
+    } else switch (msg) {
+        .program_status => |report| report.data.deinit(),
+        else => {},
     }
 
     // Window was not found, it probably quit before we handled the message.
-    // Not a problem.
+}
+
+/// Release new owned report payloads left in the mailbox during shutdown.
+fn discardProgramStatusMessages(self: *App) void {
+    while (self.mailbox.pop(global.io())) |message| switch (message) {
+        .surface_message => |surface| switch (surface.message) {
+            .program_status => |report| report.data.deinit(),
+            else => {},
+        },
+        else => {},
+    };
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
@@ -638,3 +654,15 @@ pub const Wasm = if (!builtin.target.isWasm()) struct {} else struct {
     //     }
     // }
 };
+
+test "OSC 7501 bridge: shutdown reports release ownership" {
+    const testing = std.testing;
+    var app: App = undefined;
+    app.surfaces = .empty;
+    app.mailbox = .{};
+    const body = "state=working:msg=" ++ "QUFB" ** 100;
+    const report: @import("terminal/main.zig").osc.program_status.Report = .{ .state = .working, .data = body };
+    _ = app.mailbox.push(global.io(), .{ .surface_message = .{ .surface = undefined, .message = .{ .program_status = try apprt.surface.Message.ProgramStatus.init(testing.allocator, report) } } }, .{ .instant = {} });
+    app.discardProgramStatusMessages();
+    try testing.expect(app.mailbox.pop(global.io()) == null);
+}

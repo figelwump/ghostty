@@ -16,6 +16,44 @@ pub const Message = union(enum) {
     /// we want this union to be.
     pub const WriteReq = MessageData(u8, 255);
 
+    /// Snapshot taken under the renderer lock. A UI reset can overtake the
+    /// reader while it waits for mailbox space. Every report carries enough
+    /// reset history to reject stale data and preserve stronger full resets.
+    pub const ProgramStatusOrder = struct {
+        surface_id: u64 = 0,
+        generation: u64 = 0,
+        full_reset_generation: u64 = 0,
+
+        pub const Result = union(enum) {
+            stale,
+            current,
+            reset: apprt.action.ProgramStatusReset,
+        };
+
+        pub fn apply(self: ProgramStatusOrder, current: *ProgramStatusOrder, surface_id: u64) Result {
+            if (self.surface_id != surface_id or self.generation < current.generation) return .stale;
+            const result: Result = if (self.full_reset_generation > current.full_reset_generation)
+                .{ .reset = .terminal }
+            else if (self.generation > current.generation)
+                .{ .reset = .prompt }
+            else
+                .current;
+            current.* = self;
+            return result;
+        }
+    };
+
+    /// A validated OSC 7501 report. The receiver owns the copied bytes.
+    pub const ProgramStatus = struct {
+        order: ProgramStatusOrder = .{},
+        state: terminal.osc.program_status.State,
+        data: WriteReq,
+
+        pub fn init(alloc: Allocator, report: terminal.osc.program_status.Report) !ProgramStatus {
+            return .{ .state = report.state, .data = try .init(alloc, report.data) };
+        }
+    };
+
     /// A fixed-size desktop notification payload sent to the app thread.
     pub const DesktopNotification = struct {
         /// Desktop notification title.
@@ -139,6 +177,10 @@ pub const Message = union(enum) {
 
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
+
+    /// Report and lifecycle messages share one queue to preserve ordering.
+    program_status: ProgramStatus,
+    program_status_reset: ProgramStatusOrder,
 
     /// A command has started in the shell, start a timer.
     start_command,
@@ -321,4 +363,43 @@ test "copyUtf8Z preserves UTF-8 that fits" {
     Message.DesktopNotification.copyUtf8Z(dst.len, &dst, "abcЯ");
 
     try std.testing.expectEqualStrings("abcЯ", std.mem.sliceTo(&dst, 0));
+}
+
+test "OSC 7501 bridge: report owns parser data" {
+    const testing = std.testing;
+    // Exercise both the inline and allocated mailbox representations.
+    inline for (.{ "state=working:app=cargo", "state=working:msg=" ++ "QUFB" ** 100 }) |body| {
+        var parser: terminal.osc.Parser = .init(testing.allocator);
+        defer parser.deinit();
+        parser.nextSlice("7501;");
+        parser.nextSlice(body);
+        const owned = try Message.ProgramStatus.init(testing.allocator, parser.end(0x1b).?.program_status.report);
+        defer owned.data.deinit();
+        parser.reset();
+        parser.nextSlice("7501;state=error");
+        _ = parser.end(0x1b);
+        try testing.expectEqual(terminal.osc.program_status.State.working, owned.state);
+        try testing.expectEqualStrings(body, owned.data.slice());
+    }
+}
+
+test "OSC 7501 bridge: lifecycle ordering rejects old reports and reused surfaces" {
+    const testing = std.testing;
+    var applied: Message.ProgramStatusOrder = .{};
+    const prompt: Message.ProgramStatusOrder = .{ .surface_id = 7, .generation = 1 };
+    try testing.expectEqualDeep(Message.ProgramStatusOrder.Result{ .reset = .prompt }, prompt.apply(&applied, 7));
+    // A report blocked before the reset must not recreate the old record.
+    try testing.expectEqual(Message.ProgramStatusOrder.Result.stale, (Message.ProgramStatusOrder{ .surface_id = 7 }).apply(&applied, 7));
+    // A new report can arrive ahead of both RIS and its subsequent prompt.
+    // Replaying only the prompt would incorrectly retain old done/error records.
+    const after_ris_prompt: Message.ProgramStatusOrder = .{ .surface_id = 7, .generation = 3, .full_reset_generation = 2 };
+    try testing.expectEqualDeep(Message.ProgramStatusOrder.Result{ .reset = .terminal }, after_ris_prompt.apply(&applied, 7));
+    // Later copies of those resets must not erase the new report.
+    try testing.expectEqual(Message.ProgramStatusOrder.Result.current, after_ris_prompt.apply(&applied, 7));
+    try testing.expectEqual(Message.ProgramStatusOrder.Result.stale, (Message.ProgramStatusOrder{ .surface_id = 7, .generation = 2, .full_reset_generation = 2 }).apply(&applied, 7));
+    // Native pointer reuse does not give old messages the new surface identity.
+    try testing.expectEqual(Message.ProgramStatusOrder.Result.stale, (Message.ProgramStatusOrder{ .surface_id = 8, .generation = 99, .full_reset_generation = 99 }).apply(&applied, 7));
+    try testing.expectEqualDeep(after_ris_prompt, applied);
+    const next_prompt: Message.ProgramStatusOrder = .{ .surface_id = 7, .generation = 4, .full_reset_generation = 2 };
+    try testing.expectEqualDeep(Message.ProgramStatusOrder.Result{ .reset = .prompt }, next_prompt.apply(&applied, 7));
 }

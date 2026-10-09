@@ -364,6 +364,10 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// Borrowed report and text pointers are valid only during performAction.
+    program_status: ProgramStatusAction,
+    program_status_reset: ProgramStatusReset,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -436,6 +440,8 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        program_status,
+        program_status_reset,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1081,4 +1087,150 @@ pub const OpenConfig = enum(c_int) {
 
 test {
     _ = compat_testing.refAllDeclsRecursive(@This());
+}
+
+pub const ProgramStatusAction = struct {
+    report: *const ProgramStatus,
+    pub const C = *const ProgramStatus;
+    pub fn cval(self: ProgramStatusAction) C {
+        return self.report;
+    }
+};
+
+/// Sync with ghostty_action_program_status_s. Every pointer is borrowed for
+/// the synchronous action callback only. Missing fields use null and length 0.
+pub const ProgramStatus = extern struct {
+    state: State,
+    kind: Kind,
+    progress: c_int,
+    id: ?[*]const u8,
+    id_len: usize,
+    app: ?[*]const u8,
+    app_len: usize,
+    title: ?[*]const u8,
+    title_len: usize,
+    msg: ?[*]const u8,
+    msg_len: usize,
+
+    pub const State = enum(c_int) {
+        idle,
+        working,
+        done,
+        blocked,
+        @"error",
+        clear,
+        test "ghostty.h ProgramStatus.State" {
+            try lib.checkGhosttyHEnum(State, "GHOSTTY_PROGRAM_STATUS_STATE_");
+        }
+    };
+    pub const Kind = enum(c_int) {
+        none,
+        permission,
+        question,
+        auth,
+        test "ghostty.h ProgramStatus.Kind" {
+            try lib.checkGhosttyHEnum(Kind, "GHOSTTY_PROGRAM_STATUS_KIND_");
+        }
+    };
+
+    pub fn init(
+        report: terminal.osc.program_status.Report,
+        title_buf: *[terminal.osc.program_status.max_title_bytes]u8,
+        msg_buf: *[terminal.osc.program_status.max_msg_bytes]u8,
+    ) !ProgramStatus {
+        const id = report.readOption(.id);
+        const app = report.readOption(.app);
+        var title: std.Io.Writer = .fixed(title_buf);
+        var msg: std.Io.Writer = .fixed(msg_buf);
+        try report.writeText(.title, &title);
+        try report.writeText(.msg, &msg);
+        return .{
+            .state = switch (report.state) {
+                inline else => |state| @field(State, @tagName(state)),
+            },
+            .kind = if (report.readOption(.kind)) |kind| switch (kind) {
+                inline else => |value| @field(Kind, @tagName(value)),
+            } else .none,
+            .progress = if (report.readOption(.progress)) |progress| progress else -1,
+            .id = if (id) |v| v.ptr else null,
+            .id_len = if (id) |v| v.len else 0,
+            .app = if (app) |v| v.ptr else null,
+            .app_len = if (app) |v| v.len else 0,
+            .title = if (title.buffered().len > 0) title.buffered().ptr else null,
+            .title_len = title.buffered().len,
+            .msg = if (msg.buffered().len > 0) msg.buffered().ptr else null,
+            .msg_len = msg.buffered().len,
+        };
+    }
+};
+
+pub const ProgramStatusReset = enum(c_int) {
+    terminal,
+    prompt,
+    child_exit,
+    test "ghostty.h ProgramStatusReset" {
+        try lib.checkGhosttyHEnum(ProgramStatusReset, "GHOSTTY_PROGRAM_STATUS_RESET_");
+    }
+};
+
+test "OSC 7501 bridge: callback decodes text and preserves absence" {
+    const testing = std.testing;
+    var parser: terminal.osc.Parser = .init(testing.allocator);
+    defer parser.deinit();
+    parser.nextSlice("7501;state=blocked:kind=permission:progress=42:id=build/test:app=cargo:title=UGxhbg==:msg=5a6J5YWo");
+    var title: [terminal.osc.program_status.max_title_bytes]u8 = undefined;
+    var msg: [terminal.osc.program_status.max_msg_bytes]u8 = undefined;
+    var value = try ProgramStatus.init(parser.end(0x1b).?.program_status.report, &title, &msg);
+    try testing.expectEqual(ProgramStatus.State.blocked, value.state);
+    try testing.expectEqual(ProgramStatus.Kind.permission, value.kind);
+    try testing.expectEqual(@as(c_int, 42), value.progress);
+    try testing.expectEqualStrings("build/test", value.id.?[0..value.id_len]);
+    try testing.expectEqualStrings("cargo", value.app.?[0..value.app_len]);
+    try testing.expectEqualStrings("Plan", value.title.?[0..value.title_len]);
+    try testing.expectEqualStrings("安全", value.msg.?[0..value.msg_len]);
+    parser.reset();
+    parser.nextSlice("7501;state=done:kind=auth:progress=5");
+    value = try ProgramStatus.init(parser.end(0x1b).?.program_status.report, &title, &msg);
+    try testing.expectEqual(ProgramStatus.Kind.none, value.kind);
+    try testing.expectEqual(@as(c_int, -1), value.progress);
+    try testing.expect(value.id == null and value.app == null and value.title == null and value.msg == null);
+    try testing.expectEqual(@as(usize, 0), value.id_len + value.app_len + value.title_len + value.msg_len);
+}
+
+test "ghostty.h ProgramStatus layout" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    try testing.expectEqual(@sizeOf(c.ghostty_action_program_status_s), @sizeOf(ProgramStatus));
+    try testing.expectEqual(@alignOf(c.ghostty_action_program_status_s), @alignOf(ProgramStatus));
+    inline for (@typeInfo(ProgramStatus).@"struct".fields) |field| {
+        try testing.expectEqual(@offsetOf(c.ghostty_action_program_status_s, field.name), @offsetOf(ProgramStatus, field.name));
+    }
+}
+
+test "OSC 7501 bridge: decoded limits and copied token provenance" {
+    const testing = std.testing;
+    const program_status = terminal.osc.program_status;
+    inline for (.{ "", ":title=" ++ "QUFB" ** 64 ++ ":msg=" ++ "QUFB" ** 682 ++ "QUE" }) |text| {
+        var parser: terminal.osc.Parser = .init(testing.allocator);
+        defer parser.deinit();
+        parser.nextSlice("7501;state=working:id=build/test:app=cargo");
+        parser.nextSlice(text);
+        const owned = try apprt.surface.Message.ProgramStatus.init(testing.allocator, parser.end(0x1b).?.program_status.report);
+        defer owned.data.deinit();
+        parser.reset();
+        parser.nextSlice("7501;state=idle");
+        _ = parser.end(0x1b);
+        var title: [program_status.max_title_bytes]u8 = undefined;
+        var msg: [program_status.max_msg_bytes]u8 = undefined;
+        const data = owned.data.slice();
+        const value = try ProgramStatus.init(.{ .state = owned.state, .data = data }, &title, &msg);
+        const begin = @intFromPtr(data.ptr);
+        const end = begin + data.len;
+        try testing.expect(@intFromPtr(value.id.?) >= begin and @intFromPtr(value.id.?) + value.id_len <= end);
+        try testing.expect(@intFromPtr(value.app.?) >= begin and @intFromPtr(value.app.?) + value.app_len <= end);
+        try testing.expectEqualStrings("build/test", value.id.?[0..value.id_len]);
+        try testing.expectEqualStrings("cargo", value.app.?[0..value.app_len]);
+        try testing.expectEqual(@as(usize, if (text.len == 0) 0 else program_status.max_title_bytes), value.title_len);
+        try testing.expectEqual(@as(usize, if (text.len == 0) 0 else program_status.max_msg_bytes), value.msg_len);
+    }
 }

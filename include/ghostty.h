@@ -944,6 +944,48 @@ typedef struct {
   uint64_t len;
 } ghostty_action_scrollbar_s;
 
+// OSC 7501. The host must opt in with supports_program_status. Reports
+// replace all fields for the record keyed by id; absent id addresses the root.
+// Progress is -1 when absent, otherwise 0..100 for working/blocked only.
+// Kind is NONE unless state is BLOCKED. Empty app/title/msg values are absent.
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_STATE_IDLE,
+  GHOSTTY_PROGRAM_STATUS_STATE_WORKING,
+  GHOSTTY_PROGRAM_STATUS_STATE_DONE,
+  GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_STATE_ERROR,
+  GHOSTTY_PROGRAM_STATUS_STATE_CLEAR,
+} ghostty_program_status_state_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_KIND_NONE,
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH,
+} ghostty_program_status_kind_e;
+
+// This struct and all text pointers are borrowed only for the action callback.
+// Text is decoded UTF-8, is not NUL-terminated, and uses null/0 when absent.
+typedef struct {
+  ghostty_program_status_state_e state;
+  ghostty_program_status_kind_e kind;
+  int progress;
+  const char* id;
+  size_t id_len;
+  const char* app;
+  size_t app_len;
+  const char* title;
+  size_t title_len;
+  const char* msg;
+  size_t msg_len;
+} ghostty_action_program_status_s;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_RESET_TERMINAL,
+  GHOSTTY_PROGRAM_STATUS_RESET_PROMPT,
+  GHOSTTY_PROGRAM_STATUS_RESET_CHILD_EXIT,
+} ghostty_program_status_reset_e;
+
 // apprt.Action.Key
 typedef enum {
   GHOSTTY_ACTION_QUIT,
@@ -1016,6 +1058,8 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
+  GHOSTTY_ACTION_PROGRAM_STATUS_RESET,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1060,6 +1104,8 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   ghostty_action_open_config_e open_config;
+  const ghostty_action_program_status_s* program_status;
+  ghostty_program_status_reset_e program_status_reset;
 } ghostty_action_u;
 
 typedef struct {
@@ -1099,6 +1145,9 @@ typedef struct {
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
+  // Immutable opt-in for OSC 7501 reports and resets. False by default.
+  // This struct and the matching library must be updated together.
+  bool supports_program_status;
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key

@@ -31,6 +31,11 @@ pub const StreamHandler = struct {
     /// Mailbox for the surface.
     surface_mailbox: apprt.surface.Mailbox,
 
+    /// Immutable host opt-in, independent of reloadable terminal config.
+    supports_program_status: bool = false,
+    program_status_closed: ?*const std.atomic.Value(bool) = null,
+    program_status_order: apprt.surface.Message.ProgramStatusOrder = .{},
+
     /// The shared render state
     renderer_state: *renderer.State,
 
@@ -382,13 +387,13 @@ pub const StreamHandler = struct {
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
             .kitty_clipboard => try self.kittyClipboard(value),
+            .program_status => try self.programStatus(value),
 
             // Unimplemented
             .title_push,
             .title_pop,
             .kitty_dnd,
             .osc_unknown,
-            .program_status,
             => {},
         }
     }
@@ -916,6 +921,7 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
     ) !void {
         self.terminal.fullReset();
+        self.resetProgramStatus(.terminal);
         try self.setMouseShape(.text);
 
         // Full reset clears Kitty clipboard session grants.
@@ -1478,11 +1484,12 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            .fresh_line_new_prompt => self.resetProgramStatus(.prompt),
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
             .new_command,
             .prompt_start,
             => {},
@@ -1922,6 +1929,64 @@ pub const StreamHandler = struct {
         // the read() syscall.
     }
 
+    fn programStatus(self: *StreamHandler, command: terminal.osc.Command.ProgramStatus) !void {
+        if (!self.supports_program_status) return;
+        switch (command) {
+            .query => |terminator| self.messageWriter(.{ .write_stable = switch (terminator) {
+                .st => "\x1b]7501;?\x1b\\",
+                .bel => "\x1b]7501;?\x07",
+            } }),
+            .report => |report| {
+                var owned = try apprt.surface.Message.ProgramStatus.init(self.alloc, report);
+                owned.order = self.program_status_order;
+                self.programStatusMessage(.{ .program_status = owned });
+            },
+        }
+    }
+
+    pub fn resetProgramStatus(self: *StreamHandler, reason: apprt.action.ProgramStatusReset) void {
+        if (!self.supports_program_status) return;
+        self.programStatusMessage(.{ .program_status_reset = self.advanceProgramStatus(reason) });
+    }
+
+    /// The renderer lock must be held. The UI reset binding advances the
+    /// generation here, then handles the snapshot directly after unlocking.
+    /// It must never wait for space in its own mailbox.
+    pub fn advanceProgramStatus(self: *StreamHandler, reason: apprt.action.ProgramStatusReset) apprt.surface.Message.ProgramStatusOrder {
+        self.program_status_order.generation += 1;
+        if (reason != .prompt) self.program_status_order.full_reset_generation = self.program_status_order.generation;
+        return self.program_status_order;
+    }
+
+    /// Preserve report ordering while open, but allow shutdown to join the
+    /// producer when the UI (the only consumer) has stopped draining messages.
+    fn programStatusMessage(self: *StreamHandler, msg: apprt.surface.Message) void {
+        var delivered = false;
+        defer if (!delivered) switch (msg) {
+            .program_status => |report| report.data.deinit(),
+            .program_status_reset => {},
+            else => unreachable,
+        };
+        if (self.programStatusClosed()) return;
+        if (self.surface_mailbox.push(msg, .{ .instant = {} }) > 0) {
+            delivered = true;
+            return;
+        }
+
+        self.renderer_state.mutex.unlock(global.io());
+        defer self.renderer_state.mutex.lockUncancelable(global.io());
+        while (!self.programStatusClosed()) {
+            if (self.surface_mailbox.push(msg, .{ .ns = 10 * std.time.ns_per_ms }) > 0) {
+                delivered = true;
+                return;
+            }
+        }
+    }
+
+    fn programStatusClosed(self: *const StreamHandler) bool {
+        return if (self.program_status_closed) |closed| closed.load(.acquire) else false;
+    }
+
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
@@ -2001,4 +2066,173 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "OSC 7501 bridge: capability gates queries and reports" {
+    const testing = std.testing;
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.supports_program_status = false;
+    handler.program_status_closed = null;
+    handler.program_status_order = .{};
+    try handler.programStatus(.{ .query = .st });
+    handler.resetProgramStatus(.terminal);
+    try handler.programStatus(.{ .report = .{ .state = .working, .data = "state=working" } });
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+
+    handler.supports_program_status = true;
+    handler.program_status_closed = null;
+    handler.program_status_order = .{};
+    inline for (.{ .{ terminal.osc.Terminator.st, "\x1b]7501;?\x1b\\" }, .{ terminal.osc.Terminator.bel, "\x1b]7501;?\x07" } }) |case| {
+        try handler.programStatus(.{ .query = case[0] });
+        const response = mailbox.spsc.queue.pop(global.io()).?;
+        defer response.deinit();
+        try testing.expectEqualStrings(case[1], response.write_stable);
+    }
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "OSC 7501 bridge: stream reports and lifecycle resets stay ordered" {
+    if (comptime build_config.app_runtime != .none) return error.SkipZigTest;
+    const testing = std.testing;
+    const App = @import("../App.zig");
+    var rt_app: apprt.App = .{};
+    var app_mailbox: App.Mailbox.Queue = .{};
+    var io_mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer io_mailbox.deinit(testing.allocator);
+    var term = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(testing.allocator);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = &term };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.terminal = &term;
+    handler.termio_mailbox = &io_mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.supports_program_status = true;
+    handler.program_status_closed = null;
+    handler.program_status_order = .{};
+    handler.kitty_clipboard_grants = .{};
+    handler.surface_mailbox = .{ .surface = undefined, .app = .{ .rt_app = &rt_app, .mailbox = &app_mailbox } };
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var derived = try termio.DerivedConfig.init(testing.allocator, &config);
+    defer derived.deinit();
+    handler.changeConfig(&derived);
+    // The host opt-in must survive a terminal configuration reload.
+    try handler.programStatus(.{ .query = .st });
+    try testing.expect(io_mailbox.spsc.queue.pop(global.io()).? == .color_scheme_report);
+    try testing.expectEqualStrings("\x1b]7501;?\x1b\\", io_mailbox.spsc.queue.pop(global.io()).?.write_stable);
+    var stream: StreamHandler.Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer stream.parser.deinit();
+    stream.nextSlice("\x1b]7501;state=working:app=cargo\x1b\\\x1b]133;P\x1b\\\x1b]133;A\x1b\\\x1bc");
+    const report = app_mailbox.pop(global.io()).?.surface_message.message.program_status;
+    defer report.data.deinit();
+    try testing.expectEqualStrings("state=working:app=cargo", report.data.slice());
+    try testing.expectEqual(@as(u64, 1), app_mailbox.pop(global.io()).?.surface_message.message.program_status_reset.generation);
+    try testing.expectEqual(@as(u64, 2), app_mailbox.pop(global.io()).?.surface_message.message.program_status_reset.full_reset_generation);
+    // RIS also clears the standard GUI progress report.
+    try testing.expect(app_mailbox.pop(global.io()).?.surface_message.message == .progress_report);
+    try testing.expect(app_mailbox.pop(global.io()) == null);
+    stream.nextSlice("\x1b]133;A\x1b\\\x1b]7501;state=done\x1b\\");
+    const prompt = app_mailbox.pop(global.io()).?.surface_message.message.program_status_reset;
+    const after_reset = app_mailbox.pop(global.io()).?.surface_message.message.program_status;
+    defer after_reset.data.deinit();
+    try testing.expectEqual(@as(u64, 3), after_reset.order.generation);
+    try testing.expectEqual(@as(u64, 2), after_reset.order.full_reset_generation);
+    try testing.expectEqualDeep(prompt, after_reset.order);
+    // A direct UI reset overtakes queued reports, but later reports survive.
+    stream.nextSlice("\x1b]7501;state=done:id=before\x1b\\");
+    const ui_reset = stream.handler.advanceProgramStatus(.terminal);
+    var applied: apprt.surface.Message.ProgramStatusOrder = .{};
+    try testing.expectEqualDeep(apprt.surface.Message.ProgramStatusOrder.Result{ .reset = .terminal }, ui_reset.apply(&applied, 0));
+    stream.nextSlice("\x1b]7501;state=working:id=after\x1b\\");
+    const before = app_mailbox.pop(global.io()).?.surface_message.message.program_status;
+    defer before.data.deinit();
+    const after = app_mailbox.pop(global.io()).?.surface_message.message.program_status;
+    defer after.data.deinit();
+    try testing.expectEqual(apprt.surface.Message.ProgramStatusOrder.Result.stale, before.order.apply(&applied, 0));
+    try testing.expectEqual(apprt.surface.Message.ProgramStatusOrder.Result.current, after.order.apply(&applied, 0));
+    while (io_mailbox.spsc.queue.pop(global.io())) |message| message.deinit();
+}
+
+test "OSC 7501 bridge: full mailbox releases renderer lock and retains report" {
+    if (comptime build_config.app_runtime != .none) return error.SkipZigTest;
+    const testing = std.testing;
+    const App = @import("../App.zig");
+    var rt_app: apprt.App = .{};
+    var queue: App.Mailbox.Queue = .{};
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.renderer_state = &renderer_state;
+    handler.supports_program_status = true;
+    handler.program_status_closed = null;
+    handler.program_status_order = .{};
+    handler.surface_mailbox = .{ .surface = undefined, .app = .{ .rt_app = &rt_app, .mailbox = &queue } };
+    for (0..64) |_| _ = handler.surface_mailbox.push(.{ .program_status_reset = .{ .generation = 1 } }, .{ .instant = {} });
+    const consumer = try std.Thread.spawn(.{}, struct {
+        fn run(lock: *std.Io.Mutex, mailbox: *App.Mailbox.Queue) void {
+            lock.lockUncancelable(global.io());
+            defer lock.unlock(global.io());
+            _ = mailbox.pop(global.io());
+        }
+    }.run, .{ &mutex, &queue });
+    const body = "state=working:msg=" ++ "QUFB" ** 100;
+    try handler.programStatus(.{ .report = .{ .state = .working, .data = body } });
+    consumer.join();
+    for (0..63) |_| try testing.expectEqual(@as(u64, 1), queue.pop(global.io()).?.surface_message.message.program_status_reset.generation);
+    const report = queue.pop(global.io()).?.surface_message.message.program_status;
+    defer report.data.deinit();
+    try testing.expectEqualStrings(body, report.data.slice());
+    try testing.expect(queue.pop(global.io()) == null);
+}
+
+test "OSC 7501 bridge: closing cancels blocked writer and frees report" {
+    if (comptime build_config.app_runtime != .none) return error.SkipZigTest;
+    const testing = std.testing;
+    const App = @import("../App.zig");
+    var rt_app: apprt.App = .{};
+    var queue: App.Mailbox.Queue = .{};
+    var closing: std.atomic.Value(bool) = .init(false);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.renderer_state = &renderer_state;
+    handler.supports_program_status = true;
+    handler.program_status_closed = null;
+    handler.program_status_order = .{};
+    handler.program_status_closed = &closing;
+    handler.surface_mailbox = .{ .surface = undefined, .app = .{ .rt_app = &rt_app, .mailbox = &queue } };
+    for (0..64) |_| _ = handler.surface_mailbox.push(.{ .program_status_reset = .{ .generation = 1 } }, .{ .instant = {} });
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(lock: *std.Io.Mutex, closed: *std.atomic.Value(bool)) void {
+            // The writer must release this lock before shutdown can proceed.
+            lock.lockUncancelable(global.io());
+            defer lock.unlock(global.io());
+            closed.store(true, .release);
+        }
+    }.run, .{ &mutex, &closing });
+    try handler.programStatus(.{ .report = .{ .state = .working, .data = "state=working:msg=" ++ "QUFB" ** 100 } });
+    closer.join();
+    // Closing discards future status messages too; there is no consumer.
+    handler.resetProgramStatus(.terminal);
+    for (0..64) |_| try testing.expectEqual(@as(u64, 1), queue.pop(global.io()).?.surface_message.message.program_status_reset.generation);
+    try testing.expect(queue.pop(global.io()) == null);
 }
