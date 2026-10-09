@@ -97,6 +97,10 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// The host consumes OSC 7501 reports and lifecycle actions. This is
+        /// immutable for each surface; unsupported hosts must leave it false.
+        supports_program_status: bool = false,
     };
 
     /// This is the key event sent for ghostty_surface_key and

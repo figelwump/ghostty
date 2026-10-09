@@ -76,6 +76,13 @@ app: *App,
 
 /// The windowing system surface and app.
 rt_app: *apprt.runtime.App,
+
+/// Immutable host support, copied to the IO handler at initialization.
+supports_program_status: bool = false,
+
+/// Set before joining workers so blocked status writers can stop.
+program_status_closed: std.atomic.Value(bool) = .init(false),
+program_status_order: Message.ProgramStatusOrder = .{},
 rt_surface: *apprt.runtime.Surface,
 
 /// The font structures
@@ -605,6 +612,10 @@ pub fn init(
         .alloc = alloc,
         .app = app,
         .rt_app = rt_app,
+        .supports_program_status = if (comptime apprt.runtime == apprt.embedded)
+            rt_app.opts.supports_program_status
+        else
+            false,
         .rt_surface = rt_surface,
         .font_grid_key = font_grid_key,
         .font_size = font_size,
@@ -690,6 +701,9 @@ pub fn init(
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .supports_program_status = self.supports_program_status,
+            .program_status_closed = &self.program_status_closed,
+            .program_status_surface_id = self.id,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state
@@ -799,6 +813,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    self.program_status_closed.store(true, .release);
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
@@ -1154,6 +1169,26 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .program_status => |report| {
+            defer report.data.deinit();
+            if (!self.applyProgramStatusOrder(report.order)) return;
+            // The process watcher can report exit before the PTY reader has
+            // delivered its final bytes. Apply those reports, then replay exit
+            // so final done/error records survive and transient records do not.
+            defer if (self.child_exited) self.resetProgramStatus(.child_exit);
+            var title: [terminal.osc.program_status.max_title_bytes]u8 = undefined;
+            var message_text: [terminal.osc.program_status.max_msg_bytes]u8 = undefined;
+            const value = try apprt.action.ProgramStatus.init(.{
+                .state = report.state,
+                .data = report.data.slice(),
+            }, &title, &message_text);
+            _ = try self.rt_app.performAction(.{ .surface = self }, .program_status, .{ .report = &value });
+        },
+
+        .program_status_reset => |order| {
+            _ = self.applyProgramStatusOrder(order);
+        },
+
         .progress_report => |v| {
             _ = self.rt_app.performAction(
                 .{ .surface = self },
@@ -1272,9 +1307,26 @@ fn selectionScrollTick(self: *Surface) !void {
     try self.queueRender();
 }
 
+fn applyProgramStatusOrder(self: *Surface, order: Message.ProgramStatusOrder) bool {
+    switch (order.apply(&self.program_status_order, self.id)) {
+        .stale => return false,
+        .current => {},
+        .reset => |reason| self.resetProgramStatus(reason),
+    }
+    return true;
+}
+
+fn resetProgramStatus(self: *Surface, reason: apprt.action.ProgramStatusReset) void {
+    if (!self.supports_program_status) return;
+    _ = self.rt_app.performAction(.{ .surface = self }, .program_status_reset, reason) catch |err| {
+        log.warn("apprt failed to reset program status err={}", .{err});
+    };
+}
+
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
-    // Mark our flag that we exited immediately
+    // Mark our flag before the callback so delayed reports replay exit.
     self.child_exited = true;
+    self.resetProgramStatus(.child_exit);
 
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
@@ -5049,9 +5101,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
-            self.renderer_state.mutex.lockUncancelable(global.io());
-            defer self.renderer_state.mutex.unlock(global.io());
-            self.renderer_state.terminal.fullReset();
+            const order = reset: {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                self.renderer_state.terminal.fullReset();
+                // Invalidate queued reports without blocking the UI on its own
+                // mailbox, or making the IO event loop wait for UI consumption.
+                break :reset self.io.terminal_stream.handler.advanceProgramStatus(.terminal);
+            };
+            _ = self.applyProgramStatusOrder(order);
         },
 
         .start_search => {
