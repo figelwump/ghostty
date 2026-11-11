@@ -2324,6 +2324,29 @@ pub fn cursorIsAtPrompt(self: *Terminal) bool {
     };
 }
 
+/// Returns true if the shell is currently showing its prompt or reading
+/// input, according to the shell's last semantic prompt (OSC 133) command.
+/// This requires shell integration. Without it, this always returns false.
+///
+/// Unlike `cursorIsAtPrompt`, this ignores the semantic prompt mark of the
+/// cursor's row. That mark can be a false positive: erasing a row (for
+/// example with `CSI 2 K`) keeps it. An inline TUI that runs on the primary
+/// screen, erases the rows where the shell showed its prompt and the typed
+/// command, and parks its cursor on one of them would otherwise look like
+/// a shell prompt while the program still runs. The cursor's semantic
+/// content changes only with OSC 133 commands, at the end of a `133;I`
+/// input line, and on a full reset. Program output does not change it, so
+/// it stays "output" from `133;C` until the shell starts its next prompt.
+pub fn cursorIsAtShellPrompt(self: *const Terminal) bool {
+    // The shell never shows its prompt on the alternate screen.
+    if (self.screens.active_key == .alternate) return false;
+
+    return switch (self.screens.active.cursor.semantic_content) {
+        .input, .prompt => true,
+        .output => false,
+    };
+}
+
 /// Horizontal tab moves the cursor to the next tabstop, clearing
 /// the screen to the left the tabstop.
 pub fn horizontalTab(self: *Terminal) void {
@@ -15830,6 +15853,115 @@ test "Terminal: cursorIsAtPrompt alternate screen" {
     try testing.expect(!t.cursorIsAtPrompt());
     try t.semanticPrompt(.init(.prompt_start));
     try testing.expect(!t.cursorIsAtPrompt());
+}
+
+fn testWriteVt(t: *Terminal, bytes: []const u8) void {
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(bytes);
+}
+
+test "Terminal: cursorIsAtShellPrompt follows the shell's OSC 133 state" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // No shell integration yet.
+    testWriteVt(&t, "$ ");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+
+    // Prompt, then input.
+    testWriteVt(&t, "\r\n\x1b]133;A\x07");
+    try testing.expect(t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "$ \x1b]133;B\x07");
+    try testing.expect(t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "ls");
+    try testing.expect(t.cursorIsAtShellPrompt());
+
+    // Typed input that wraps over several rows is still input.
+    testWriteVt(&t, " --all" ++ " --long" ** 6);
+    try testing.expect(t.screens.active.cursor.y > 1);
+    try testing.expect(t.cursorIsAtShellPrompt());
+
+    // The command starts, then writes output.
+    testWriteVt(&t, "\r\n\x1b]133;C\x07");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "file1\r\nfile2\r\n");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+
+    // The command ends and the shell shows its next prompt.
+    testWriteVt(&t, "\x1b]133;D;0\x07");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expect(t.cursorIsAtShellPrompt());
+
+    // The shell never shows its prompt on the alternate screen.
+    testWriteVt(&t, "\x1b[?1049h");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "\x1b]133;A\x07");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "\x1b[?1049l");
+    try testing.expect(t.cursorIsAtShellPrompt());
+}
+
+/// An inline TUI (for example Claude Code) runs on the primary screen below
+/// a long command line. When the terminal is resized, it erases the rows
+/// from the top with `CSI 2 K` and redraws its frame from row 0, over the
+/// rows where the shell showed its prompt and the wrapped command line.
+/// `CSI 2 K` keeps the rows' semantic prompt marks, so the cursor can rest
+/// on a row that is still marked as a prompt while the program runs.
+fn testShellPromptAfterInlineRedraw(
+    cols: size.CellCountInt,
+    new_cols: size.CellCountInt,
+) !void {
+    const alloc = testing.allocator;
+    const rows = 40;
+    var t = try init(testing.io, alloc, .{ .cols = cols, .rows = rows });
+    defer t.deinit(alloc);
+
+    // The shell's prompt and a command line of about 800 characters, which
+    // wraps over several rows.
+    const launch_part = "LAUNCH_VAR=/tmp/launch/value/" ++ "x" ** 34 ++ " ";
+    const launch_line = launch_part ** 12 ++ "claude --model test";
+    testWriteVt(&t, "\x1b]133;A;cl=line\x07~/proj % \x1b]133;B\x07");
+    testWriteVt(&t, launch_line);
+    try testing.expect(t.screens.active.cursor.y > 5);
+    try testing.expect(t.cursorIsAtShellPrompt());
+
+    // Enter: the shell starts the command, which draws its frame below.
+    testWriteVt(&t, "\r\n\x1b]133;C\x07");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "app frame row\r\n" ** 8 ++ "> ");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+
+    // The window is resized. The program erases every row from the top and
+    // redraws its frame from row 0, then parks its cursor on its input row.
+    try t.resize(alloc, .{ .cols = new_cols, .rows = rows });
+    testWriteVt(&t, "\x1b[H" ++ "\x1b[2K\x1b[1B" ** rows ++ "\x1b[H");
+    testWriteVt(&t, "app frame row\r\n" ** 6 ++ "> ");
+    try testing.expectEqual(@as(size.CellCountInt, 6), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(size.CellCountInt, 2), t.screens.active.cursor.x);
+
+    // The cursor's row still carries the mark of the command line that was
+    // there, so the row-based check reports a prompt. The shell's state
+    // does not.
+    try testing.expect(t.screens.active.cursor.page_row.semantic_prompt != .none);
+    try testing.expect(t.cursorIsAtPrompt());
+    try testing.expect(!t.cursorIsAtShellPrompt());
+
+    // The program exits and the shell shows its next prompt.
+    testWriteVt(&t, "\r\n\x1b]133;D;0\x07");
+    try testing.expect(!t.cursorIsAtShellPrompt());
+    testWriteVt(&t, "\x1b]133;A;cl=line\x07~/proj % \x1b]133;B\x07");
+    try testing.expect(t.cursorIsAtShellPrompt());
+}
+
+test "Terminal: cursorIsAtShellPrompt after an inline program redraws on a narrower window" {
+    try testShellPromptAfterInlineRedraw(124, 101);
+}
+
+test "Terminal: cursorIsAtShellPrompt after an inline program redraws on a wider window" {
+    try testShellPromptAfterInlineRedraw(101, 124);
 }
 
 test "Terminal: cursor defaults update current default cursor" {
