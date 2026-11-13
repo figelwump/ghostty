@@ -85,8 +85,9 @@ jobs:
   required:
     name: "Required Checks: Test"
     if: always()
-    runs-on: namespace-profile-ghostty-xsm
+    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-xsm' || 'ubuntu-24.04' }}
     needs:
+      - fork-macos
       - skip
       - build-gate
       - build-bench
@@ -146,6 +147,12 @@ jobs:
       - build-libghostty-vt-docs
 
     steps:
+      # A fork must run its tests; skipped upstream jobs alone are not success.
+      - if: github.repository == 'figelwump/ghostty'
+        name: Require fork tests and frameworks
+        env:
+          FORK_RESULT: ${{ needs.fork-macos.result }}
+        run: test "$FORK_RESULT" = success
       - id: status
         name: Determine status
         run: |
@@ -164,6 +171,71 @@ jobs:
         run: |
           echo "One or more required build workflows failed: ${{ steps.status.outputs.results }}"
           exit 1
+
+  # The Toastty fork uses standard hosted runners without Namespace or secrets.
+  # Keep upstream's broader platform matrix gated by its existing skip job.
+  fork-macos:
+    if: github.repository == 'figelwump/ghostty'
+    name: Fork macOS (${{ matrix.optimize }}, ${{ matrix.target }})
+    runs-on: xcode-27
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - optimize: Debug
+            target: native
+          - optimize: ReleaseFast
+            target: universal
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build tools
+        run: |
+          test "$(uname -m)" = arm64
+          brew install gettext
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          curl --fail --location --retry 3 \
+            https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz \
+            --output "$RUNNER_TEMP/zig.tar.xz"
+          echo "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a  $RUNNER_TEMP/zig.tar.xz" | shasum -a 256 --check
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-aarch64-macos-0.17.0" >> "$GITHUB_PATH"
+      - name: Record source and tools
+        run: |
+          git rev-parse HEAD
+          zig version
+          xcodebuild -version
+      - name: Test downstream integration and terminal library
+        if: matrix.optimize == 'Debug'
+        run: |
+          zig build test -Dapp-runtime=none -Demit-macos-app=false -Dsentry=false \
+            -Dtest-filter='OSC 7501' -Dtest-filter='ghostty.h' -Dtest-filter='Terminal:' \
+            -Dtest-filter='linkHoverEnabled' -Dtest-filter='keyToMouseShape' \
+            -Dtest-filter='tmux active_window' -Dtest-shards=4 -j3 --summary all
+          zig build test-lib-vt -Dtest-filter='7501' -Dtest-filter='program_status' \
+            -Dtest-filter='semantic prompt' -Dtest-filter='cursorIsAtShellPrompt' \
+            -Dtest-shards=4 -j3 --summary all
+      - name: Build framework
+        run: |
+          zig build -Demit-macos-app=false -Demit-xcframework=true -Dsentry=false \
+            -Dxcframework-target=${{ matrix.target }} -Doptimize=${{ matrix.optimize }} \
+            -j3 --summary all
+      - name: Verify framework architectures and headers
+        env:
+          FRAMEWORK_TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$FRAMEWORK_TARGET" = universal ]; then
+            framework=macos/GhosttyKit.xcframework/macos-arm64_x86_64
+            lipo -verify_arch arm64 x86_64 "$framework/ghostty-internal.a"
+          else
+            framework=macos/GhosttyKit.xcframework/macos-arm64
+            lipo -verify_arch arm64 "$framework/libghostty-internal.a"
+          fi
+          cmp include/ghostty.h "$framework/Headers/ghostty.h"
 
   build-bench:
     # We build benchmarks on large because it uses fast mode
