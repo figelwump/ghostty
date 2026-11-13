@@ -230,10 +230,11 @@ jobs:
         run: |
           if [ "$FRAMEWORK_TARGET" = universal ]; then
             framework=macos/GhosttyKit.xcframework/macos-arm64_x86_64
-            lipo -verify_arch arm64 x86_64 "$framework/ghostty-internal.a"
+            lipo "$framework/ghostty-internal.a" -verify_arch arm64
+            lipo "$framework/ghostty-internal.a" -verify_arch x86_64
           else
             framework=macos/GhosttyKit.xcframework/macos-arm64
-            lipo -verify_arch arm64 "$framework/libghostty-internal.a"
+            lipo "$framework/libghostty-internal.a" -verify_arch arm64
           fi
           cmp include/ghostty.h "$framework/Headers/ghostty.h"
 
