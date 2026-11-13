@@ -368,7 +368,7 @@ test "copyUtf8Z preserves UTF-8 that fits" {
 test "OSC 7501 bridge: report owns parser data" {
     const testing = std.testing;
     // Exercise both the inline and allocated mailbox representations.
-    inline for (.{ "state=working:app=cargo", "state=working:msg=" ++ "QUFB" ** 100 }) |body| {
+    inline for (.{ "state=working:app=cargo", "state=working:msg=" ++ @as([400]u8, std.simd.repeat(400, "QUFB".*)) }) |body| {
         var parser: terminal.osc.Parser = .init(testing.allocator);
         defer parser.deinit();
         parser.nextSlice("7501;");
